@@ -1,0 +1,295 @@
+/*
+ * ESP32 百叶窗控制器 - 优化版
+ * GPIO5 -> 继电器IN3 (上行控制)
+ * GPIO6 -> 继电器IN4 (暂停控制)
+ * GPIO4 -> 继电器IN5 (下行控制)
+ * GPIO18 -> 继电器IN2 (关闭控制)
+ * GPIO19 -> 继电器IN1 (打开控制)
+ * 高电平触发，初始状态为低电平
+ */
+
+#include <WiFi.h>
+
+// ========== 网络配置 ==========
+const char* ssid = "aaa";           // 树莓派热点名称
+const char* password = "12345678";  // 树莓派热点密码
+const char* host = "192.168.4.1";   // 树莓派热点默认IP
+const uint16_t port = 8888;         // 通信端口
+
+// ========== 引脚配置 ==========
+const int PIN_UP = 5;        // GPIO5 -> IN3 (上行)
+const int PIN_PAUSE = 6;     // GPIO6 -> IN4 (暂停)
+const int PIN_DOWN = 4;      // GPIO4 -> IN5 (下行)
+const int PIN_CLOSE = 18;    // GPIO18 -> IN2 (关闭)
+const int PIN_OPEN = 19;     // GPIO19 -> IN1 (打开)
+const int PRESS_MS = 1200;   // 触发保持时间（毫秒）
+
+// ========== 系统变量 ==========
+WiFiClient client;
+bool connected = false;
+unsigned long lastConnectionCheck = 0;
+const unsigned long CONNECTION_CHECK_INTERVAL = 5000;
+
+// 继电器保护
+unsigned long lastRelayAction = 0;
+const unsigned long RELAY_MIN_INTERVAL = 500;  // 继电器最小触发间隔（毫秒）
+
+void setup() {
+  // 第一步：立即设置所有GPIO为低电平
+  pinMode(PIN_UP, OUTPUT);
+  pinMode(PIN_PAUSE, OUTPUT);
+  pinMode(PIN_DOWN, OUTPUT);
+  pinMode(PIN_CLOSE, OUTPUT);
+  pinMode(PIN_OPEN, OUTPUT);
+  
+  digitalWrite(PIN_UP, LOW);
+  digitalWrite(PIN_PAUSE, LOW);
+  digitalWrite(PIN_DOWN, LOW);
+  digitalWrite(PIN_CLOSE, LOW);
+  digitalWrite(PIN_OPEN, LOW);
+  
+  // 短暂延时确保状态稳定
+  delay(100);
+  
+  // 第二步：初始化串口
+  Serial.begin(115200);
+  delay(100);
+  
+  Serial.println("\n\n========================================");
+  Serial.println("ESP32 百叶窗控制器 - 优化版");
+  Serial.println("========================================");
+  
+  // 第三步：系统配置信息
+  Serial.println("\n🔧 硬件配置:");
+  Serial.println("  上行控制: GPIO5 -> 继电器IN3");
+  Serial.println("  暂停控制: GPIO6 -> 继电器IN4");
+  Serial.println("  下行控制: GPIO4 -> 继电器IN5");
+  Serial.println("  关闭控制: GPIO18 -> 继电器IN2");
+  Serial.println("  打开控制: GPIO19 -> 继电器IN1");
+  Serial.println("  触发方式: 高电平触发");
+  Serial.println("  初始状态: 所有继电器均断开");
+  Serial.println("  触发时长: 1200ms");
+  
+  // 第四步：验证初始状态
+  Serial.print("\n🔍 初始状态检查 - ");
+  Serial.print("GPIO5: ");
+  Serial.print(digitalRead(PIN_UP) == LOW ? "低电平 ✓" : "高电平");
+  Serial.print(", GPIO6: ");
+  Serial.print(digitalRead(PIN_PAUSE) == LOW ? "低电平 ✓" : "高电平");
+  Serial.print(", GPIO4: ");
+  Serial.print(digitalRead(PIN_DOWN) == LOW ? "低电平 ✓" : "高电平");
+  Serial.print(", GPIO18: ");
+  Serial.print(digitalRead(PIN_CLOSE) == LOW ? "低电平 ✓" : "高电平");
+  Serial.print(", GPIO19: ");
+  Serial.println(digitalRead(PIN_OPEN) == LOW ? "低电平 ✓" : "高电平");
+  
+  // 第五步：连接网络
+  Serial.println("\n🌐 开始网络连接...");
+  connectToWiFi();
+  connectToServer();
+  
+  Serial.println("\n✅ 系统启动完成，等待指令...");
+}
+
+void loop() {
+  // 1. 维持网络连接
+  if (!connected) {
+    reconnect();
+    delay(2000);
+    return;
+  }
+  
+  // 2. 处理服务器指令
+  if (client.available()) {
+    char cmd = client.read();
+    Serial.print("📨 收到指令: '");
+    Serial.print(cmd);
+    Serial.println("'");
+    
+    // 检查继电器保护间隔
+    unsigned long currentTime = millis();
+    if (currentTime - lastRelayAction < RELAY_MIN_INTERVAL) {
+      Serial.println("⏳ 继电器保护中，跳过指令");
+      return;
+    }
+    
+    // 处理不同指令
+    switch(cmd) {
+      case 'U':
+      case 'u':
+        triggerUpward();
+        break;
+      case 'D':
+      case 'd':
+        triggerDownward();
+        break;
+      case 'S':
+      case 's':
+        triggerPause();
+        break;
+      case 'C':
+      case 'c':
+        triggerClose();
+        break;
+      case 'O':
+      case 'o':
+        triggerOpen();
+        break;
+      default:
+        Serial.println("❌ 未知指令");
+        break;
+    }
+  }
+  
+  // 3. 定期检查连接状态
+  if (millis() - lastConnectionCheck > CONNECTION_CHECK_INTERVAL) {
+    lastConnectionCheck = millis();
+    if (!client.connected()) {
+      connected = false;
+      Serial.println("⚠️  与服务器连接断开");
+    }
+  }
+}
+
+// ========== 控制函数 ==========
+
+void triggerRelay(int pin, const char* actionName) {
+  Serial.print("🔧 执行: ");
+  Serial.println(actionName);
+  
+  // 确保所有其他继电器先断开
+  digitalWrite(PIN_UP, LOW);
+  digitalWrite(PIN_PAUSE, LOW);
+  digitalWrite(PIN_DOWN, LOW);
+  digitalWrite(PIN_CLOSE, LOW);
+  digitalWrite(PIN_OPEN, LOW);
+  delay(50);
+  
+  // 目标继电器吸合
+  digitalWrite(pin, HIGH);
+  Serial.print("  ✅ ");
+  Serial.print(actionName);
+  Serial.println("继电器吸合");
+  
+  // 保持触发
+  unsigned long startTime = millis();
+  while (millis() - startTime < PRESS_MS) {
+    delay(100);
+  }
+  
+  // 目标继电器释放
+  digitalWrite(pin, LOW);
+  Serial.print("  ✅ ");
+  Serial.print(actionName);
+  Serial.println("继电器释放");
+  
+  // 更新最后动作时间
+  lastRelayAction = millis();
+  
+  Serial.print("🎯 ");
+  Serial.print(actionName);
+  Serial.println("动作完成");
+  
+  // 发送确认
+  if (client.connected()) {
+    String response = "OK: ";
+    response += actionName;
+    response += " completed.";
+    client.println(response);
+  }
+}
+
+// 触发上行函数
+void triggerUpward() {
+  triggerRelay(PIN_UP, "百叶上行");
+}
+
+// 触发下行函数
+void triggerDownward() {
+  triggerRelay(PIN_DOWN, "百叶下行");
+}
+
+// 触发暂停函数
+void triggerPause() {
+  triggerRelay(PIN_PAUSE, "百叶暂停");
+}
+
+// 触发关闭函数
+void triggerClose() {
+  triggerRelay(PIN_CLOSE, "百叶关闭");
+}
+
+// 触发打开函数
+void triggerOpen() {
+  triggerRelay(PIN_OPEN, "百叶打开");
+}
+
+// 发送状态信息
+void sendStatus() {
+  if (client.connected()) {
+    String status = "STATUS: ";
+    status += "UP=";
+    status += digitalRead(PIN_UP) == HIGH ? "HIGH" : "LOW";
+    status += ", PAUSE=";
+    status += digitalRead(PIN_PAUSE) == HIGH ? "HIGH" : "LOW";
+    status += ", DOWN=";
+    status += digitalRead(PIN_DOWN) == HIGH ? "HIGH" : "LOW";
+    status += ", CLOSE=";
+    status += digitalRead(PIN_CLOSE) == HIGH ? "HIGH" : "LOW";
+    status += ", OPEN=";
+    status += digitalRead(PIN_OPEN) == HIGH ? "HIGH" : "LOW";
+    status += ", Connected=YES";
+    client.println(status);
+  }
+}
+
+// ========== 网络函数 ==========
+
+void connectToWiFi() {
+  Serial.print("📡 连接热点: ");
+  Serial.println(ssid);
+  WiFi.begin(ssid, password);
+  
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    Serial.print(".");
+    attempts++;
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    Serial.println("\n✅ Wi-Fi连接成功!");
+    Serial.print("📶 IP地址: ");
+    Serial.println(WiFi.localIP());
+  } else {
+    Serial.println("\n❌ Wi-Fi连接失败");
+  }
+}
+
+void connectToServer() {
+  Serial.print("🔌 连接服务器: ");
+  Serial.print(host);
+  Serial.print(":");
+  Serial.println(port);
+  
+  if (client.connect(host, port)) {
+    connected = true;
+    Serial.println("✅ 服务器连接成功!");
+    client.println("ESP32_Blinds_Controller_Optimized");
+  } else {
+    Serial.println("❌ 服务器连接失败");
+    connected = false;
+  }
+}
+
+void reconnect() {
+  Serial.println("🔄 尝试重新连接...");
+  
+  if (WiFi.status() != WL_CONNECTED) {
+    connectToWiFi();
+  }
+  
+  if (WiFi.status() == WL_CONNECTED) {
+    connectToServer();
+  }
+}
